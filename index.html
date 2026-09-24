@@ -2,20 +2,48 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>Просмотр 3D-модели</title>
 <style>
   html,body{margin:0;height:100%;overflow:hidden;background:#16191d;font-family:'Segoe UI',Arial,sans-serif}
   #app{position:fixed;inset:0}
-  #hud{position:fixed;left:12px;top:12px;color:#dfe3e8;background:rgba(18,20,24,.78);padding:10px 14px;border-radius:8px;font-size:13px;pointer-events:none;max-width:60vw}
+  #hud{position:fixed;left:12px;top:12px;color:#dfe3e8;background:rgba(18,20,24,.78);padding:10px 14px;border-radius:8px;font-size:13px;pointer-events:none;max-width:70vw;z-index:5}
   #hud b{font-size:14px;display:block;margin-bottom:2px}
-  #err{position:fixed;left:12px;bottom:12px;right:12px;color:#ffc2b8;background:rgba(64,22,18,.9);padding:8px 12px;border-radius:8px;font-size:12px;display:none;white-space:pre-wrap;max-height:40vh;overflow:auto}
+  #hud small{color:#98a2ad}
+  #loader{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#e8edf2;background:#101215;z-index:10;text-align:center;padding:20px}
+  #loader .big{font-size:18px;margin-bottom:16px}
+  #lbar{width:min(320px,70vw);height:6px;background:#2a3038;border-radius:3px;overflow:hidden}
+  #lfill{width:0%;height:100%;background:#4d9de0;transition:width .15s ease}
+  #lpct{margin-top:10px;font-size:13px;color:#9fb0bf;min-height:18px}
+  #err{position:fixed;left:12px;bottom:12px;right:12px;color:#ffc2b8;background:rgba(64,22,18,.92);padding:10px 12px;border-radius:8px;font-size:13px;display:none;white-space:pre-wrap;max-height:40vh;overflow:auto;z-index:20}
 </style>
 </head>
 <body>
 <div id="app"></div>
-<div id="hud"><b>Просмотр 3D-модели</b><span id="st">загрузка…</span></div>
+<div id="hud"><b>Просмотр 3D-модели</b><span id="st">загрузка…</span><br><small>Вращение — мышь или палец; зум — колесо или щипок</small></div>
+<div id="loader"><div class="big" id="lmsg">Загружаю модель…</div><div id="lbar"><div id="lfill"></div></div><div id="lpct"></div></div>
 <div id="err"></div>
+<script>
+(function () {
+  function fatal(msg) {
+    var eb = document.getElementById('err');
+    if (eb) { eb.style.display = 'block'; eb.textContent = msg; }
+    var ld = document.getElementById('loader');
+    if (ld) ld.style.display = 'none';
+  }
+  window.__fatal = fatal;
+  var okImp = typeof HTMLScriptElement.supports === 'function' && HTMLScriptElement.supports('importmap');
+  if (!okImp) {
+    fatal('Этот браузер не поддерживает современные веб-модули (import maps).\nОткройте ссылку в свежем Chrome, Edge, Firefox или Safari (iOS 16.4 и новее).');
+    return;
+  }
+  try {
+    var c = document.createElement('canvas');
+    var gl = c.getContext('webgl2') || c.getContext('webgl');
+    if (!gl) fatal('В браузере отключён WebGL (3D-графика). Включите аппаратное ускорение или откройте в другом браузере.');
+  } catch (e) { fatal('WebGL недоступен: ' + e); }
+})();
+</script>
 <script type="importmap">
 { "imports": {
   "three": "./vendor/three.module.js",
@@ -29,12 +57,17 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { IfcAPI } from 'web-ifc';
 
 const st = document.getElementById('st');
+const loader = document.getElementById('loader');
+const lmsg = document.getElementById('lmsg');
+const lfill = document.getElementById('lfill');
+const lpct = document.getElementById('lpct');
 const errBox = document.getElementById('err');
 const showErr = (m) => { errBox.style.display = 'block'; errBox.textContent = String(m); };
 window.addEventListener('error', e => showErr(e.message));
+window.addEventListener('unhandledrejection', e => showErr((e.reason && (e.reason.stack || e.reason.message)) || e.reason));
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(devicePixelRatio);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 document.getElementById('app').appendChild(renderer.domElement);
@@ -56,17 +89,42 @@ const grid = new THREE.GridHelper(400, 100, 0x3a4048, 0x272c33);
 grid.position.y = -0.02;
 scene.add(grid);
 
+function setProgress(frac, text) {
+  lfill.style.width = Math.max(0, Math.min(1, frac)) * 100 + '%';
+  if (text !== undefined) lpct.textContent = text;
+}
+
+async function fetchWithProgress(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error('HTTP ' + resp.status + ' при загрузке модели');
+  const total = +(resp.headers.get('Content-Length') || 0);
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    const mb = (got / 1048576).toFixed(1);
+    setProgress(total ? got / total : 0, total ? 'модель: ' + mb + ' / ' + (total / 1048576).toFixed(0) + ' МБ' : 'модель: ' + mb + ' МБ');
+  }
+  const buf = new Uint8Array(got);
+  let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.length; }
+  return buf;
+}
+
 async function main() {
+  window.__STAGE = 'boot';
   const api = new IfcAPI();
   api.SetWasmPath('./vendor/web-ifc/');
   await api.Init();
-  st.textContent = 'чтение файла…';
   window.__STAGE = 'init';
 
-  const resp = await fetch('./models/model.ifc');
-  if (!resp.ok) throw new Error('HTTP ' + resp.status + ' при загрузке model.ifc');
-  const buf = new Uint8Array(await resp.arrayBuffer());
-  st.textContent = 'разбор IFC (' + (buf.length / 1048576).toFixed(0) + ' МБ)…';
+  const buf = await fetchWithProgress('./models/model.ifc');
+  lmsg.textContent = 'Разбираю IFC…';
+  setProgress(1, '');
 
   const modelID = api.OpenModel(buf, { COORDINATE_TO_ORIGIN: true });
   window.__STAGE = 'parsed';
@@ -74,7 +132,6 @@ async function main() {
   const root = new THREE.Group();
   let count = 0, vtx = 0;
   const matCache = new Map();
-  window.__STAGE = 'geometry';
 
   api.StreamAllMeshes(modelID, (flatMesh) => {
     const geoms = flatMesh.geometries;
@@ -111,7 +168,7 @@ async function main() {
       }
       root.add(new THREE.Mesh(bg, mat));
       count++; vtx += n;
-      if (count % 300 === 0) st.textContent = 'геометрия… мешей ' + count;
+      if (count % 400 === 0) lpct.textContent = 'геометрия: ' + count + ' элементов';
     }
   });
 
@@ -124,10 +181,15 @@ async function main() {
   root.position.sub(center);
   const maxDim = Math.max(size.x, size.y, size.z) || 10;
   camera.near = maxDim / 2000; camera.far = maxDim * 100; camera.updateProjectionMatrix();
-  camera.position.set(maxDim * 1.0, maxDim * 0.75, maxDim * 1.25);
+
+  const aspect = innerWidth / innerHeight;
+  let dist = maxDim * 1.05;
+  if (aspect < 1) dist = maxDim * 1.05 * (1 / Math.max(aspect, 0.45)) * 0.75;
+  camera.position.copy(new THREE.Vector3(0.8, 0.55, 1.0).normalize().multiplyScalar(dist));
   controls.target.set(0, 0, 0); controls.update();
   grid.scale.setScalar(maxDim / 50);
 
+  loader.style.display = 'none';
   st.textContent = 'готово: мешей ' + count + ', вершин ' + vtx.toLocaleString('ru-RU');
   window.__READY = { meshes: count, vertices: vtx };
   window.__app = { camera, controls, scene, renderer };

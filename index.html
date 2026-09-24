@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Просмотр 3D-модели</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#16191d;font-family:'Segoe UI',Arial,sans-serif}
+  #app{position:fixed;inset:0}
+  #hud{position:fixed;left:12px;top:12px;color:#dfe3e8;background:rgba(18,20,24,.78);padding:10px 14px;border-radius:8px;font-size:13px;pointer-events:none;max-width:60vw}
+  #hud b{font-size:14px;display:block;margin-bottom:2px}
+  #err{position:fixed;left:12px;bottom:12px;right:12px;color:#ffc2b8;background:rgba(64,22,18,.9);padding:8px 12px;border-radius:8px;font-size:12px;display:none;white-space:pre-wrap;max-height:40vh;overflow:auto}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="hud"><b>Просмотр 3D-модели</b><span id="st">загрузка…</span></div>
+<div id="err"></div>
+<script type="importmap">
+{ "imports": {
+  "three": "./vendor/three.module.js",
+  "three/addons/": "./vendor/jsm/",
+  "web-ifc": "./vendor/web-ifc/web-ifc-api.js"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { IfcAPI } from 'web-ifc';
+
+const st = document.getElementById('st');
+const errBox = document.getElementById('err');
+const showErr = (m) => { errBox.style.display = 'block'; errBox.textContent = String(m); };
+window.addEventListener('error', e => showErr(e.message));
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.getElementById('app').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x16191d);
+
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 20000);
+camera.position.set(40, 30, 40);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x2a2f36, 1.2));
+const dl1 = new THREE.DirectionalLight(0xffffff, 1.5); dl1.position.set(60, 90, 70); scene.add(dl1);
+const dl2 = new THREE.DirectionalLight(0xffffff, 0.55); dl2.position.set(-70, 50, -60); scene.add(dl2);
+
+const grid = new THREE.GridHelper(400, 100, 0x3a4048, 0x272c33);
+grid.position.y = -0.02;
+scene.add(grid);
+
+async function main() {
+  const api = new IfcAPI();
+  api.SetWasmPath('./vendor/web-ifc/');
+  await api.Init();
+  st.textContent = 'чтение файла…';
+  window.__STAGE = 'init';
+
+  const resp = await fetch('./models/model.ifc');
+  if (!resp.ok) throw new Error('HTTP ' + resp.status + ' при загрузке model.ifc');
+  const buf = new Uint8Array(await resp.arrayBuffer());
+  st.textContent = 'разбор IFC (' + (buf.length / 1048576).toFixed(0) + ' МБ)…';
+
+  const modelID = api.OpenModel(buf, { COORDINATE_TO_ORIGIN: true });
+  window.__STAGE = 'parsed';
+
+  const root = new THREE.Group();
+  let count = 0, vtx = 0;
+  const matCache = new Map();
+  window.__STAGE = 'geometry';
+
+  api.StreamAllMeshes(modelID, (flatMesh) => {
+    const geoms = flatMesh.geometries;
+    for (let i = 0; i < geoms.size(); i++) {
+      const pg = geoms.get(i);
+      const g = api.GetGeometry(modelID, pg.geometryExpressID);
+      const vraw = api.GetVertexArray(g.GetVertexData(), g.GetVertexDataSize());
+      const iraw = api.GetIndexArray(g.GetIndexData(), g.GetIndexDataSize());
+      const n = vraw.length / 6;
+      const pos = new Float32Array(n * 3), nor = new Float32Array(n * 3);
+      for (let k = 0; k < n; k++) {
+        pos[k*3]   = vraw[k*6];   pos[k*3+1] = vraw[k*6+1]; pos[k*3+2] = vraw[k*6+2];
+        nor[k*3]   = vraw[k*6+3]; nor[k*3+1] = vraw[k*6+4]; nor[k*3+2] = vraw[k*6+5];
+      }
+      const bg = new THREE.BufferGeometry();
+      bg.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      bg.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+      bg.setIndex(new THREE.BufferAttribute(new Uint32Array(iraw), 1));
+      bg.applyMatrix4(new THREE.Matrix4().fromArray(pg.flatTransformation));
+
+      const c = pg.color;
+      const key = (c.x + ',' + c.y + ',' + c.z + ',' + c.w);
+      let mat = matCache.get(key);
+      if (!mat) {
+        mat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(c.x, c.y, c.z),
+          transparent: c.w < 1,
+          opacity: c.w < 1 ? Math.max(c.w, 0.12) : 1,
+          side: THREE.DoubleSide,
+          metalness: 0.02,
+          roughness: 0.9
+        });
+        matCache.set(key, mat);
+      }
+      root.add(new THREE.Mesh(bg, mat));
+      count++; vtx += n;
+      if (count % 300 === 0) st.textContent = 'геометрия… мешей ' + count;
+    }
+  });
+
+  scene.add(root);
+  window.__STAGE = 'built';
+
+  const box = new THREE.Box3().setFromObject(root);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  root.position.sub(center);
+  const maxDim = Math.max(size.x, size.y, size.z) || 10;
+  camera.near = maxDim / 2000; camera.far = maxDim * 100; camera.updateProjectionMatrix();
+  camera.position.set(maxDim * 1.0, maxDim * 0.75, maxDim * 1.25);
+  controls.target.set(0, 0, 0); controls.update();
+  grid.scale.setScalar(maxDim / 50);
+
+  st.textContent = 'готово: мешей ' + count + ', вершин ' + vtx.toLocaleString('ru-RU');
+  window.__READY = { meshes: count, vertices: vtx };
+  window.__app = { camera, controls, scene, renderer };
+  window.__STAGE = 'ready';
+}
+
+main().catch(e => { showErr(e.stack || e.message); window.__ERR = String(e); console.error(e); });
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+(function loop() {
+  requestAnimationFrame(loop);
+  controls.update();
+  renderer.render(scene, camera);
+})();
+</script>
+</body>
+</html>

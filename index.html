@@ -107,7 +107,7 @@ async function fetchWithProgress(url) {
     chunks.push(value);
     got += value.length;
     const mb = (got / 1048576).toFixed(1);
-    setProgress(total ? got / total : 0, total ? 'модель: ' + mb + ' / ' + (total / 1048576).toFixed(0) + ' МБ' : 'модель: ' + mb + ' МБ');
+    setProgress(total ? Math.min(got / total, 0.985) : 0, 'загружено: ' + mb + ' МБ');
   }
   const buf = new Uint8Array(got);
   let off = 0;
@@ -182,9 +182,10 @@ async function main() {
   const maxDim = Math.max(size.x, size.y, size.z) || 10;
   camera.near = maxDim / 2000; camera.far = maxDim * 100; camera.updateProjectionMatrix();
 
-  const aspect = innerWidth / innerHeight;
-  let dist = maxDim * 1.05;
-  if (aspect < 1) dist = maxDim * 1.05 * (1 / Math.max(aspect, 0.45)) * 0.75;
+  const vFOV = THREE.MathUtils.degToRad(camera.fov);
+  const hFOV = 2 * Math.atan(Math.tan(vFOV / 2) * camera.aspect);
+  const radius = size.length() / 2;
+  const dist = (radius / Math.sin(Math.min(vFOV, hFOV) / 2)) * 1.12;
   camera.position.copy(new THREE.Vector3(0.8, 0.55, 1.0).normalize().multiplyScalar(dist));
   controls.target.set(0, 0, 0); controls.update();
   grid.scale.setScalar(maxDim / 50);
